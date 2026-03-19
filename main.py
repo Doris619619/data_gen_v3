@@ -134,8 +134,9 @@ def main():
     
     # 从 UCG 提取 micro_partition
     micro_partition = {}
-    level1 = ucg["level_1_details"]
-    level0 = ucg["level_0_global"]
+    ucg_root = ucg.get("UCG_Graph", ucg)
+    level1 = ucg_root["level_1_details"]
+    level0 = ucg_root["level_0_global"]
 
     micro_bbox_info = {node["id"]: node for node in level0["nodes"]}
 
@@ -294,7 +295,8 @@ def batch_generate(num_circuits: int = 10, output_dir: str = "./dataset/batch/")
             
             # 从 UCG 提取 micro_partition
             micro_partition = {}
-            level1 = ucg["level_1_details"]
+            ucg_root = ucg.get("UCG_Graph", ucg)
+            level1 = ucg_root["level_1_details"]
             for micro_id, details in level1.items():
                 micro_partition[micro_id] = [node["id"] for node in details["nodes"]]
             

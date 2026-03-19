@@ -8,7 +8,7 @@ PCB Router - A* 基于网格的布线器
 
 import math
 import heapq
-from typing import List, Dict, Tuple, Set, Optional
+from typing import Any, List, Dict, Tuple, Set, Optional
 from dataclasses import dataclass, field
 from enum import Enum
 from collections import defaultdict
@@ -609,325 +609,390 @@ class AStarRouter:
 
 
 class UCGExporter:
-    """UCG格式导出器"""
-    
+    """UCG格式导出器（对齐 prompt 规则）"""
+
+    SMALL_WIDTH = 3.0
+    MEDIUM_WIDTH = 6.0
+    LARGE_WIDTH = 8.0
+
     def __init__(self):
         self.space_node_counter = 0
-    
+        self.generation_logs: List[str] = []
+
     def _next_space_node(self) -> str:
         self.space_node_counter += 1
         return f"SN_{self.space_node_counter}"
-    
+
     def _reset_space_node_counter(self):
-        """重置Space Node计数器"""
         self.space_node_counter = 0
-    
+
+    def _extract_numeric_suffix(self, text: str, default: int = 0) -> int:
+        if not text:
+            return default
+        buf = ""
+        for ch in reversed(text):
+            if ch.isdigit():
+                buf = ch + buf
+            elif buf:
+                break
+        if not buf:
+            return default
+        return int(buf)
+
+    def _micro_sort_key(self, micro_id: str) -> Tuple[int, str]:
+        return (self._extract_numeric_suffix(micro_id, 10**9), micro_id)
+
+    def _component_sort_key(self, comp_id: str) -> Tuple[int, str]:
+        return (self._extract_numeric_suffix(comp_id, 10**9), comp_id)
+
+    def _normalize_rotation(self, value: Any) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _normalize_pad_id(self, pin_id: str) -> str:
+        if not pin_id:
+            return "Pad_1"
+        if pin_id.startswith("Pad_"):
+            return pin_id
+        return f"Pad_{pin_id}"
+
+    def _rotated_size(self, size: List[float], rot: float) -> Tuple[float, float]:
+        w = float(size[0]) if len(size) >= 1 else 1.0
+        h = float(size[1]) if len(size) >= 2 else 1.0
+        if rot in [90.0, 270.0, -90.0, -270.0]:
+            return h, w
+        return w, h
+
+    def _channel_width_for_net(self, net_id: str) -> float:
+        name = (net_id or "").upper()
+        medium_tokens = ["VCC_5V"]
+        large_tokens = [
+            "GND", "VCC_12V", "VCC_48V", "/EL+", "/EL-", "IND", "L", "MOSFET", "TO-252"
+        ]
+        if any(tok in name for tok in large_tokens):
+            return self.LARGE_WIDTH
+        if any(tok in name for tok in medium_tokens):
+            return self.MEDIUM_WIDTH
+        return self.SMALL_WIDTH
+
+    def _channel_size_label(self, width: float) -> str:
+        if width >= self.LARGE_WIDTH:
+            return "Large"
+        if width >= self.MEDIUM_WIDTH:
+            return "Medium"
+        return "Small"
+
+    def _build_chain_spatial_topology(
+        self,
+        ordered_ids: List[str],
+        dimensions: Dict[str, Tuple[float, float]],
+        shared_width_lookup: Dict[Tuple[str, str], float],
+    ) -> List[Dict]:
+        if len(ordered_ids) < 2:
+            return []
+
+        edges = []
+        for idx in range(len(ordered_ids) - 1):
+            source_id = ordered_ids[idx]
+            target_id = ordered_ids[idx + 1]
+            source_w, source_h = dimensions.get(source_id, (1.0, 1.0))
+            target_w, target_h = dimensions.get(target_id, (1.0, 1.0))
+            channel_width = shared_width_lookup.get((source_id, target_id), self.SMALL_WIDTH)
+
+            dx = float((source_w / 2.0) + channel_width + (target_w / 2.0))
+            dy = 0.0
+
+            edges.append({
+                "type": "SPATIAL",
+                "source": source_id,
+                "target": target_id,
+                "dx": round(dx, 3),
+                "dy": round(dy, 3),
+            })
+
+        return edges
+
     def export(self, placement: Dict, routed_connections: List[RoutedConnection],
                pad_infos: Dict[str, PadInfo], components: Dict, metadata: Dict) -> Dict:
-        """
-        导出UCG格式
-        
-        Args:
-            placement: 原始布局数据
-            routed_connections: 按实际布线顺序的连接列表
-            pad_infos: 焊盘信息映射
-            components: 组件信息映射
-            metadata: 电路元数据（包含micro_info, micro_partition等）
-        """
-        # 提取Micro信息
+        del placement, routed_connections, pad_infos
+
         micro_info = metadata.get("micro_info", {})
         micro_partition = metadata.get("micro_partition", {})
-        
+
         if not micro_info:
-            exit("Error: micro_info is missing in metadata.")
-        
-        # 构建组件到Micro映射
-        comp_to_micro = {}
+            raise ValueError("micro_info is missing in metadata")
+
+        comp_to_micro: Dict[str, str] = {}
         for comp_id, comp in components.items():
             comp_to_micro[comp_id] = comp.get("micro_id", "Micro_1")
-        
-        # 如果组件没有micro_id，从micro_partition推断
-        if micro_partition:
-            for micro_id, comp_ids in micro_partition.items():
-                for comp_id in comp_ids:
-                    comp_to_micro[comp_id] = micro_id
-        
-        # 按Micro分组的布线连接
-        micro_connections = defaultdict(list)  # micro_id -> [RoutedConnection]
-        inter_micro_connections = []  # 跨Micro连接
-        
-        for conn in routed_connections:
-            if conn.source_micro == conn.target_micro:
-                # Micro内部连接
-                micro_connections[conn.source_micro].append(conn)
-            else:
-                # 跨Micro连接
-                inter_micro_connections.append(conn)
-                # 跨Micro连接也要添加到两个相关Micro的连接列表中
-                micro_connections[conn.source_micro].append(conn)
-                micro_connections[conn.target_micro].append(conn)
-        
-        # 构建UCG
+
+        for micro_id, comp_ids in micro_partition.items():
+            for comp_id in comp_ids:
+                comp_to_micro[comp_id] = micro_id
+
+        all_micros = set(micro_info.keys()) | set(comp_to_micro.values())
+        ordered_micros = sorted(all_micros, key=self._micro_sort_key)
+
+        micro_to_nets: Dict[str, Set[str]] = defaultdict(set)
+        for comp_id, comp in components.items():
+            micro_id = comp_to_micro.get(comp_id, comp.get("micro_id", "Micro_1"))
+            for pin in comp.get("pins", []):
+                net_id = pin.get("net", "")
+                if net_id:
+                    micro_to_nets[micro_id].add(net_id)
+
         self._reset_space_node_counter()
-        level_0 = self._build_level_0(
-            micro_info, components, comp_to_micro,
-            inter_micro_connections
-        )
-        
-        level_1 = self._build_level_1(
-            micro_info, components, comp_to_micro,
-            micro_connections, pad_infos
-        )
-        
-        ucg = {
-            "level_0_global": level_0,
-            "level_1_details": level_1
+        level_0 = self._build_level_0(ordered_micros, micro_info, micro_to_nets)
+        level_1 = self._build_level_1(ordered_micros, components, comp_to_micro)
+
+        return {
+            "UCG_Graph": {
+                "level_0_global": level_0,
+                "level_1_details": level_1,
+            }
         }
-        
-        return ucg
-    
-    def _build_level_0(self, micro_info: Dict, components: Dict,
-                       comp_to_micro: Dict, inter_micro_connections: List[RoutedConnection]) -> Dict:
-        """构建level_0_global"""
-        self._reset_space_node_counter()
-        
-        # 构建Micro节点
+
+    def _build_level_0(self, ordered_micros: List[str], micro_info: Dict,
+                       micro_to_nets: Dict[str, Set[str]]) -> Dict:
         nodes = []
-        micro_positions = {}
-        
-        for micro_id, info in micro_info.items():
-            bbox = info.get("bbox", [0, 0, 10, 10])
-            w = bbox[2] - bbox[0]
-            h = bbox[3] - bbox[1]
-            center_x = (bbox[0] + bbox[2]) / 2
-            center_y = (bbox[1] + bbox[3]) / 2
-            
+        dimensions: Dict[str, Tuple[float, float]] = {}
+
+        for micro_id in ordered_micros:
+            info = micro_info.get(micro_id, {})
+            bbox = info.get("bbox", [0.0, 0.0, 10.0, 10.0])
+            min_x, min_y, max_x, max_y = [float(v) for v in bbox]
+            w = max_x - min_x
+            h = max_y - min_y
+            center_x = (min_x + max_x) / 2.0
+            center_y = (min_y + max_y) / 2.0
+
+            dimensions[micro_id] = (w, h)
             nodes.append({
                 "id": micro_id,
                 "type": "Micro",
-                "w": round(w, 2),
-                "h": round(h, 2)
-            })
-            micro_positions[micro_id] = (center_x, center_y)
-        
-        nodes.sort(key=lambda x: x["id"])
-        
-        # 构建Micro之间的空间拓扑（网格化排序）
-        spatial_topology = self._build_gridded_spatial_topology(
-            micro_info, micro_positions, is_micro_level=True
-        )
-        
-        # 构建跨Micro路由资源
-        routing_resources = self._build_inter_micro_routing_resources(inter_micro_connections)
-        
-        return {
-            "nodes": nodes,
-            "spatial_topology": spatial_topology,
-            "routing_resources": routing_resources
-        }
-    
-    def _build_gridded_spatial_topology(self, entity_info: Dict,
-                                        entity_positions: Dict,
-                                        is_micro_level: bool = False) -> List[Dict]:
-        """
-        使用网格化方法构建空间拓扑
-        
-        Args:
-            entity_info: Micro或Component的信息字典
-            entity_positions: 实体的位置字典 {id: (x, y)}
-            is_micro_level: 是否是Micro级别（True）还是Component级别（False）
-        """
-        if len(entity_positions) < 2:
-            return []
-        
-        # 计算平均尺寸
-        widths = []
-        heights = []
-        for entity_id, info in entity_info.items():
-            if is_micro_level:
-                bbox = info.get("bbox", [0, 0, 10, 10])
-                w = bbox[2] - bbox[0]
-                h = bbox[3] - bbox[1]
-            else:
-                # Component level - info是component dict
-                size = info.get("size", [1, 1])
-                w, h = size
-                rot = info.get("rotation", 0)
-                if rot in [90, 270, -90, -270]:
-                    w, h = h, w
-            widths.append(w)
-            heights.append(h)
-        
-        avg_width = sum(widths) / len(widths) if widths else 10.0
-        avg_height = sum(heights) / len(heights) if heights else 10.0
-        
-        # 使用平均尺寸作为网格大小
-        grid_w = avg_width
-        grid_h = avg_height
-        
-        # 将每个实体分配到网格中
-        entity_grid_map = {}  # {entity_id: (grid_col, grid_row)}
-        for entity_id, (x, y) in entity_positions.items():
-            grid_col = int(x / grid_w)
-            grid_row = int(y / grid_h)
-            entity_grid_map[entity_id] = (grid_col, grid_row, x, y)
-        
-        # 按网格坐标排序：先按列（从左到右），再按行（从上到下，Y值越大越靠上）
-        # 注意：PCB坐标系Y向下为正，所以"从上到下"意味着Y值从小到大
-        sorted_entities = sorted(
-            entity_grid_map.items(),
-            key=lambda item: (item[1][0], item[1][1], item[1][2], item[1][3])  # (col, row, x, y)
-        )
-        
-        # 生成相邻实体之间的空间约束
-        spatial_topology = []
-        for i in range(len(sorted_entities) - 1):
-            entity_id_1, (col1, row1, x1, y1) = sorted_entities[i]
-            entity_id_2, (col2, row2, x2, y2) = sorted_entities[i + 1]
-            
-            dx = x2 - x1
-            dy = y2 - y1
-            
-            spatial_topology.append({
-                "type": "SPATIAL",
-                "source": entity_id_1,
-                "target": entity_id_2,
-                "dx": round(dx, 1),
-                "dy": round(dy, 1)
-            })
-        
-        return spatial_topology
-    
-    def _build_inter_micro_routing_resources(self, inter_micro_connections: List[RoutedConnection]) -> List[Dict]:
-        """构建跨Micro的路由资源"""
-        routing_resources = []
-        
-        # 直接列出所有跨Micro的物理连接
-        for conn in inter_micro_connections:
-            source_ref = f"{conn.source_micro}.{conn.source_component}.Pin_{conn.source_pin}({conn.net_id})"
-            target_ref = f"{conn.target_micro}.{conn.target_component}.Pin_{conn.target_pin}({conn.net_id})"
-            
-            routing_resources.append({
-                "net_id": conn.net_id,
-                "path_sequence": [source_ref, self._next_space_node(), target_ref]
-            })
-        
-        routing_resources.sort(key=lambda x: x["net_id"])
-        return routing_resources
-    
-    def _build_level_1(self, micro_info: Dict, components: Dict,
-                       comp_to_micro: Dict, micro_connections: Dict,
-                       pad_infos: Dict[str, PadInfo]) -> Dict:
-        """构建level_1_details"""
-        level_1 = {}
-        
-        for micro_id in micro_info.keys():
-            micro_components = {
-                comp_id: comp for comp_id, comp in components.items()
-                if comp_to_micro.get(comp_id) == micro_id
-            }
-            
-            connections = micro_connections.get(micro_id, [])
-            
-            level_1[micro_id] = self._build_micro_detail(
-                micro_id, micro_components, connections, comp_to_micro
-            )
-        
-        return level_1
-    
-    def _build_micro_detail(self, micro_id: str, micro_components: Dict,
-                            connections: List[RoutedConnection],
-                            comp_to_micro: Dict) -> Dict:
-        """构建单个Micro的详细信息"""
-        self._reset_space_node_counter()  # 每个Micro独立计数
-        
-        # 构建节点
-        nodes = []
-        comp_positions = {}
-        comp_info_map = {}  # 保存component信息用于计算尺寸
-        
-        for comp_id, comp in micro_components.items():
-            pos = comp.get("position", [0, 0])
-            rot = comp.get("rotation", 0)
-            size = comp.get("size", [1, 1])
-            
-            w, h = size
-            if rot in [90, 270, -90, -270]:
-                w, h = h, w
-            
-            # 构建pads
-            pads = {}
-            for pin in comp.get("pins", []):
-                pad_id = f"Pad_{pin['pin_id']}"
-                pads[pad_id] = {
-                    "rel_pos": pin["rel_pos"],
-                    "rot": float(pin.get("rotation", 0)),
-                    "w": pin["size"][0],
-                    "h": pin["size"][1],
-                    "net": pin.get("net", "")
-                }
-            
-            nodes.append({
-                "id": comp_id,
-                "rot": float(rot),
+                "rot": 0.0,
                 "w": round(w, 3),
                 "h": round(h, 3),
-                "pads": pads
+                "center_x": round(center_x, 3),
+                "center_y": round(center_y, 3),
             })
-            
-            comp_positions[comp_id] = (pos[0], pos[1])
-            comp_info_map[comp_id] = {"size": [w, h], "rotation": rot}
-        
-        nodes.sort(key=lambda x: x["id"])
-        
-        # 构建空间拓扑（网格化排序）
-        spatial_topology = self._build_gridded_spatial_topology(
-            comp_info_map, comp_positions, is_micro_level=False
+
+        shared_width_lookup: Dict[Tuple[str, str], float] = {}
+        for idx in range(len(ordered_micros) - 1):
+            m1 = ordered_micros[idx]
+            m2 = ordered_micros[idx + 1]
+            shared = micro_to_nets.get(m1, set()) & micro_to_nets.get(m2, set())
+            if shared:
+                max_width = max(self._channel_width_for_net(net_id) for net_id in shared)
+            else:
+                max_width = self.SMALL_WIDTH
+            shared_width_lookup[(m1, m2)] = max_width
+
+        spatial_topology = self._build_chain_spatial_topology(
+            ordered_micros,
+            dimensions,
+            shared_width_lookup,
         )
-        
-        # 构建路由资源（直接列出物理连接）
-        routing_resources = self._build_micro_routing_resources(
-            connections, micro_id, comp_to_micro
-        )
-        
+
+        routing_resources = self._build_inter_micro_routing_resources(ordered_micros, micro_to_nets)
         return {
             "nodes": nodes,
             "spatial_topology": spatial_topology,
-            "routing_resources": routing_resources
+            "routing_resources": routing_resources,
         }
-    
-    def _build_micro_routing_resources(self, connections: List[RoutedConnection],
-                                        current_micro_id: str,
-                                        comp_to_micro: Dict) -> List[Dict]:
-        """
-        构建Micro内部路由资源
-        直接列出所有已布线的物理连接
-        """
-        routing_resources = []
-        
-        # 直接列出所有物理连接
-        for conn in connections:
-            # 源端点
-            source_micro = comp_to_micro.get(conn.source_component, current_micro_id)
-            if source_micro == current_micro_id:
-                source_endpoint = f"{conn.source_component}.Pad_{conn.source_pin}({conn.net_id})"
-            else:
-                source_endpoint = f"{source_micro}.{conn.source_component}.Pad_{conn.source_pin}({conn.net_id})"
-            
-            # 目标端点
-            target_micro = comp_to_micro.get(conn.target_component, current_micro_id)
-            if target_micro == current_micro_id:
-                target_endpoint = f"{conn.target_component}.Pad_{conn.target_pin}({conn.net_id})"
-            else:
-                target_endpoint = f"{target_micro}.{conn.target_component}.Pad_{conn.target_pin}({conn.net_id})"
-            
-            routing_resources.append({
-                "net_id": conn.net_id,
-                "path_sequence": [source_endpoint, self._next_space_node(), target_endpoint]
+
+    def _build_inter_micro_routing_resources(
+        self,
+        ordered_micros: List[str],
+        micro_to_nets: Dict[str, Set[str]],
+    ) -> List[Dict]:
+        net_to_micros: Dict[str, List[str]] = defaultdict(list)
+        for micro_id in ordered_micros:
+            for net_id in sorted(micro_to_nets.get(micro_id, set())):
+                net_to_micros[net_id].append(micro_id)
+
+        resources = []
+        for net_id in sorted(net_to_micros.keys()):
+            micros = net_to_micros[net_id]
+            if len(micros) < 2:
+                continue
+
+            for idx in range(len(micros) - 1):
+                source_micro = micros[idx]
+                target_micro = micros[idx + 1]
+                sn_id = self._next_space_node()
+                width = self._channel_width_for_net(net_id)
+                resources.append({
+                    "net_id": net_id,
+                    "path_sequence": [
+                        f"{source_micro}.{net_id}",
+                        sn_id,
+                        f"{target_micro}.{net_id}",
+                    ],
+                    "space_node": {
+                        "id": sn_id,
+                        "size": self._channel_size_label(width),
+                    },
+                })
+
+        return resources
+
+    def _build_level_1(self, ordered_micros: List[str], components: Dict,
+                       comp_to_micro: Dict[str, str]) -> Dict:
+        level_1: Dict[str, Dict] = {}
+        for micro_id in ordered_micros:
+            micro_components = [
+                (comp_id, comp) for comp_id, comp in components.items()
+                if comp_to_micro.get(comp_id, comp.get("micro_id", "Micro_1")) == micro_id
+            ]
+            micro_components.sort(key=lambda item: self._component_sort_key(item[0]))
+            level_1[micro_id] = self._build_micro_detail(micro_id, micro_components)
+        return level_1
+
+    def _build_micro_detail(self, micro_id: str,
+                            micro_components: List[Tuple[str, Dict]]) -> Dict:
+        micro_num = self._extract_numeric_suffix(micro_id, 1)
+        alias_map: Dict[str, str] = {}
+        nodes = []
+        dimensions: Dict[str, Tuple[float, float]] = {}
+        comp_nets: Dict[str, Set[str]] = {}
+        pad_net_lookup: Dict[str, str] = {}
+        net_to_endpoints: Dict[str, List[str]] = defaultdict(list)
+
+        for idx, (original_comp_id, comp) in enumerate(micro_components, start=1):
+            alias_id = f"M{micro_num}_Comp_{idx}"
+            alias_map[original_comp_id] = alias_id
+
+            comp_rot = self._normalize_rotation(comp.get("rotation", 0.0))
+            comp_w, comp_h = self._rotated_size(comp.get("size", [1.0, 1.0]), comp_rot)
+
+            pads: Dict[str, Dict] = {}
+            comp_net_set: Set[str] = set()
+            for pin in comp.get("pins", []):
+                pad_id = self._normalize_pad_id(str(pin.get("pin_id", "Pad_1")))
+                rel_pos = pin.get("rel_pos", [0.0, 0.0])
+                if not isinstance(rel_pos, list) or len(rel_pos) != 2:
+                    rel_pos = [0.0, 0.0]
+
+                pin_size = pin.get("size", [0.6, 0.6])
+                if not isinstance(pin_size, list) or len(pin_size) != 2:
+                    pin_size = [0.6, 0.6]
+
+                net_id = str(pin.get("net", ""))
+                pad_rot = self._normalize_rotation(pin.get("rotation", comp_rot))
+                pads[pad_id] = {
+                    "rel_pos": [float(rel_pos[0]), float(rel_pos[1])],
+                    "rot": float(pad_rot),
+                    "w": float(pin_size[0]),
+                    "h": float(pin_size[1]),
+                    "net": net_id,
+                }
+
+                endpoint = f"{alias_id}.{pad_id}({net_id})"
+                pad_net_lookup[endpoint] = net_id
+                if net_id:
+                    net_to_endpoints[net_id].append(endpoint)
+                    comp_net_set.add(net_id)
+
+            nodes.append({
+                "id": alias_id,
+                "rot": float(comp_rot),
+                "w": round(float(comp_w), 3),
+                "h": round(float(comp_h), 3),
+                "pads": pads,
             })
-        
-        routing_resources.sort(key=lambda x: x["net_id"])
-        return routing_resources
+
+            dimensions[alias_id] = (float(comp_w), float(comp_h))
+            comp_nets[alias_id] = comp_net_set
+
+        nodes.sort(key=lambda node: self._component_sort_key(node["id"]))
+        ordered_aliases = [node["id"] for node in nodes]
+
+        shared_width_lookup: Dict[Tuple[str, str], float] = {}
+        for idx in range(len(ordered_aliases) - 1):
+            c1 = ordered_aliases[idx]
+            c2 = ordered_aliases[idx + 1]
+            shared_nets = comp_nets.get(c1, set()) & comp_nets.get(c2, set())
+            if shared_nets:
+                max_width = max(self._channel_width_for_net(net_id) for net_id in shared_nets)
+            else:
+                max_width = self.SMALL_WIDTH
+            shared_width_lookup[(c1, c2)] = max_width
+
+        spatial_topology = self._build_chain_spatial_topology(
+            ordered_aliases,
+            dimensions,
+            shared_width_lookup,
+        )
+
+        routing_resources = self._build_micro_routing_resources(
+            micro_id=micro_id,
+            net_to_endpoints=net_to_endpoints,
+            pad_net_lookup=pad_net_lookup,
+        )
+
+        return {
+            "nodes": nodes,
+            "spatial_topology": spatial_topology,
+            "routing_resources": routing_resources,
+        }
+
+    def _build_micro_routing_resources(self, micro_id: str,
+                                       net_to_endpoints: Dict[str, List[str]],
+                                       pad_net_lookup: Dict[str, str]) -> List[Dict]:
+        resources = []
+        for net_id in sorted(net_to_endpoints.keys()):
+            endpoints = sorted(net_to_endpoints[net_id])
+            if len(endpoints) < 2:
+                continue
+
+            source = endpoints[0]
+            for target in endpoints[1:]:
+                if not self._is_valid_same_net_entry(source, target, net_id, pad_net_lookup, micro_id):
+                    continue
+
+                sn_id = self._next_space_node()
+                width = self._channel_width_for_net(net_id)
+                resources.append({
+                    "net_id": net_id,
+                    "path_sequence": [source, sn_id, target],
+                    "space_node": {
+                        "id": sn_id,
+                        "size": self._channel_size_label(width),
+                    },
+                })
+
+        return resources
+
+    def _is_valid_same_net_entry(self, source_endpoint: str, target_endpoint: str,
+                                 net_id: str, pad_net_lookup: Dict[str, str],
+                                 micro_id: str) -> bool:
+        source_net = pad_net_lookup.get(source_endpoint)
+        target_net = pad_net_lookup.get(target_endpoint)
+
+        if source_net != net_id or target_net != net_id:
+            self.generation_logs.append(
+                f"Skip routing in {micro_id}: endpoint net mismatch ({source_endpoint}, {target_endpoint}, {net_id})"
+            )
+            return False
+
+        try:
+            source_comp = source_endpoint.split(".", 1)[0]
+            target_comp = target_endpoint.split(".", 1)[0]
+        except Exception:
+            self.generation_logs.append(
+                f"Skip routing in {micro_id}: malformed endpoint ({source_endpoint}, {target_endpoint})"
+            )
+            return False
+
+        micro_num = self._extract_numeric_suffix(micro_id, 1)
+        if not source_comp.startswith(f"M{micro_num}_Comp_"):
+            return False
+        if not target_comp.startswith(f"M{micro_num}_Comp_"):
+            return False
+        return True
 
 class PCBRouter:
     """PCB 布线器主类"""

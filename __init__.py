@@ -13,7 +13,7 @@ from micro_layout import MicroLayoutPlanner
 from generator import PCBPlacementGenerator
 from ucg_converter import UCGConverter
 from visualizer import PlacementVisualizer
-from validator import DatasetValidator, DatasetStatistics
+from validator import DatasetValidator, DatasetStatistics, PromptUCGValidator
 
 __all__ = [
     # 数据结构
@@ -25,5 +25,5 @@ __all__ = [
     # 核心类
     'MicroLayoutPlanner', 'PCBPlacementGenerator', 'UCGConverter',
     # 工具类
-    'PlacementVisualizer', 'DatasetValidator', 'DatasetStatistics',
+    'PlacementVisualizer', 'DatasetValidator', 'DatasetStatistics', 'PromptUCGValidator',
 ]

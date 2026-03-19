@@ -2,6 +2,8 @@
 数据集验证和统计工具
 """
 
+import json
+from collections import defaultdict, deque
 from typing import List, Dict
 import numpy as np
 
@@ -150,3 +152,258 @@ class DatasetStatistics:
                 print(f"  Mean: {s['mean']:.2f} ± {s['std']:.2f}")
                 print(f"  Range: [{s['min']:.2f}, {s['max']:.2f}]")
                 print(f"  Median: {s['median']:.2f}")
+
+
+class PromptUCGValidator:
+    """按 prompt 约束验证 UCG 输出"""
+
+    def validate(self, ucg_data: Dict, metadata: Dict = None) -> Dict:
+        errors: List[str] = []
+        warnings: List[str] = []
+        metadata = metadata or {}
+
+        # 1) JSON 合法性
+        try:
+            json.dumps(ucg_data)
+        except Exception as ex:
+            errors.append(f"JSON serialization failed: {ex}")
+            return {"valid": False, "errors": errors, "warnings": warnings}
+
+        root = self._get_ucg_root(ucg_data)
+        level_0 = root.get("level_0_global", {})
+        level_1 = root.get("level_1_details", {})
+
+        self._check_rot_and_pads(level_0, level_1, errors)
+        self._check_spatial_float(level_0, level_1, errors)
+        self._check_spatial_dag(level_0, level_1, errors)
+        self._check_spatial_anchor(level_1, errors)
+
+        self._check_level0_routing_syntax(level_0, errors)
+        self._check_level1_routing_constraints(level_1, errors)
+
+        self._check_micros_coverage(level_1, metadata, errors, warnings)
+
+        return {
+            "valid": len(errors) == 0,
+            "errors": errors,
+            "warnings": warnings,
+        }
+
+    def _get_ucg_root(self, ucg_data: Dict) -> Dict:
+        if "UCG_Graph" in ucg_data and isinstance(ucg_data["UCG_Graph"], dict):
+            return ucg_data["UCG_Graph"]
+        return ucg_data
+
+    def _check_rot_and_pads(self, level_0: Dict, level_1: Dict, errors: List[str]):
+        for node in level_0.get("nodes", []):
+            if "rot" not in node:
+                errors.append(f"level_0 node missing rot: {node.get('id', 'UNKNOWN')}")
+
+        for micro_id, detail in level_1.items():
+            for node in detail.get("nodes", []):
+                node_id = node.get("id", "UNKNOWN")
+                if "rot" not in node:
+                    errors.append(f"{micro_id}.{node_id} missing rot")
+                pads = node.get("pads")
+                if not isinstance(pads, dict):
+                    errors.append(f"{micro_id}.{node_id} missing pads object")
+                    continue
+                for pad_id, pad in pads.items():
+                    for field in ["rel_pos", "rot", "w", "h", "net"]:
+                        if field not in pad:
+                            errors.append(f"{micro_id}.{node_id}.{pad_id} missing field: {field}")
+
+    def _check_spatial_float(self, level_0: Dict, level_1: Dict, errors: List[str]):
+        for edge in level_0.get("spatial_topology", []):
+            if not isinstance(edge.get("dx"), (int, float)):
+                errors.append(f"level_0 spatial edge dx is not float: {edge}")
+            if not isinstance(edge.get("dy"), (int, float)):
+                errors.append(f"level_0 spatial edge dy is not float: {edge}")
+
+        for micro_id, detail in level_1.items():
+            for edge in detail.get("spatial_topology", []):
+                if not isinstance(edge.get("dx"), (int, float)):
+                    errors.append(f"{micro_id} spatial edge dx is not float: {edge}")
+                if not isinstance(edge.get("dy"), (int, float)):
+                    errors.append(f"{micro_id} spatial edge dy is not float: {edge}")
+
+    def _check_spatial_dag(self, level_0: Dict, level_1: Dict, errors: List[str]):
+        level0_nodes = [n.get("id") for n in level_0.get("nodes", []) if n.get("id")]
+        if self._has_cycle(level0_nodes, level_0.get("spatial_topology", [])):
+            errors.append("level_0 spatial_topology is not DAG")
+
+        for micro_id, detail in level_1.items():
+            node_ids = [n.get("id") for n in detail.get("nodes", []) if n.get("id")]
+            if self._has_cycle(node_ids, detail.get("spatial_topology", [])):
+                errors.append(f"{micro_id} spatial_topology is not DAG")
+
+    def _check_spatial_anchor(self, level_1: Dict, errors: List[str]):
+        for micro_id, detail in level_1.items():
+            node_ids = [n.get("id") for n in detail.get("nodes", []) if n.get("id")]
+            edges = detail.get("spatial_topology", [])
+            n = len(node_ids)
+
+            if n <= 1:
+                continue
+            if len(edges) < n - 1:
+                errors.append(f"{micro_id} spatial_topology has fewer than n-1 edges")
+
+            if not self._is_connected_undirected(node_ids, edges):
+                errors.append(f"{micro_id} components are not fully anchored in spatial_topology")
+
+    def _check_level0_routing_syntax(self, level_0: Dict, errors: List[str]):
+        for idx, rr in enumerate(level_0.get("routing_resources", [])):
+            net_id = rr.get("net_id", "")
+            seq = rr.get("path_sequence", [])
+            if not isinstance(seq, list) or len(seq) < 3:
+                errors.append(f"level_0 routing_resources[{idx}] path_sequence malformed")
+                continue
+
+            for token in [seq[0], seq[-1]]:
+                if "." not in token:
+                    errors.append(f"level_0 endpoint malformed: {token}")
+                    continue
+                left, right = token.split(".", 1)
+                if not left.startswith("Micro_"):
+                    errors.append(f"level_0 endpoint must start with Micro_: {token}")
+                if "Comp_" in token or "Pad_" in token or "(" in token:
+                    errors.append(f"level_0 endpoint contains component/pad syntax: {token}")
+                if right != net_id:
+                    errors.append(f"level_0 endpoint net mismatch with net_id={net_id}: {token}")
+
+    def _check_level1_routing_constraints(self, level_1: Dict, errors: List[str]):
+        for micro_id, detail in level_1.items():
+            micro_num = self._extract_numeric_suffix(micro_id)
+            node_pad_net = self._build_node_pad_net_map(detail)
+
+            for idx, rr in enumerate(detail.get("routing_resources", [])):
+                net_id = rr.get("net_id", "")
+                seq = rr.get("path_sequence", [])
+                if not isinstance(seq, list) or len(seq) < 3:
+                    errors.append(f"{micro_id} routing_resources[{idx}] path_sequence malformed")
+                    continue
+
+                endpoints = [seq[0], seq[-1]]
+                for endpoint in endpoints:
+                    comp_id, pad_id, net_label = self._parse_level1_endpoint(endpoint)
+                    if not comp_id or not pad_id:
+                        errors.append(f"{micro_id} malformed endpoint: {endpoint}")
+                        continue
+
+                    # 3) level_1 不得跨 micro
+                    expected_prefix = f"M{micro_num}_Comp_"
+                    if not comp_id.startswith(expected_prefix):
+                        errors.append(f"{micro_id} has cross-micro endpoint: {endpoint}")
+
+                    # 4) path_sequence net label == net_id
+                    if net_label != net_id:
+                        errors.append(f"{micro_id} net label mismatch: {endpoint} vs net_id={net_id}")
+
+                    # 5) endpoint pad 真实存在
+                    if comp_id not in node_pad_net or pad_id not in node_pad_net[comp_id]:
+                        errors.append(f"{micro_id} endpoint pad not found: {endpoint}")
+                        continue
+
+                    # 6) endpoint pad 的真实 net == net_id
+                    real_net = node_pad_net[comp_id][pad_id]
+                    if real_net != net_id:
+                        errors.append(
+                            f"{micro_id} endpoint real net mismatch: {endpoint} real={real_net} net_id={net_id}"
+                        )
+
+    def _check_micros_coverage(self, level_1: Dict, metadata: Dict,
+                               errors: List[str], warnings: List[str]):
+        expected_from_info = set(metadata.get("micro_info", {}).keys())
+        expected_count = metadata.get("num_micros")
+        actual_set = set(level_1.keys())
+
+        if expected_from_info and actual_set != expected_from_info:
+            errors.append(
+                f"level_1 micros mismatch: actual={sorted(actual_set)} expected={sorted(expected_from_info)}"
+            )
+
+        if isinstance(expected_count, int) and len(actual_set) != expected_count:
+            errors.append(
+                f"level_1 micro count mismatch: actual={len(actual_set)} expected={expected_count}"
+            )
+
+        if "Micro_N" in actual_set:
+            warnings.append("Found placeholder Micro_N in output")
+
+    def _has_cycle(self, node_ids: List[str], edges: List[Dict]) -> bool:
+        graph = defaultdict(list)
+        indeg = {n: 0 for n in node_ids}
+
+        for edge in edges:
+            s = edge.get("source")
+            t = edge.get("target")
+            if s in indeg and t in indeg:
+                graph[s].append(t)
+                indeg[t] += 1
+
+        q = deque([n for n, deg in indeg.items() if deg == 0])
+        visited = 0
+        while q:
+            u = q.popleft()
+            visited += 1
+            for v in graph[u]:
+                indeg[v] -= 1
+                if indeg[v] == 0:
+                    q.append(v)
+        return visited != len(node_ids)
+
+    def _is_connected_undirected(self, node_ids: List[str], edges: List[Dict]) -> bool:
+        if not node_ids:
+            return True
+        graph = defaultdict(set)
+        for edge in edges:
+            s = edge.get("source")
+            t = edge.get("target")
+            if s in node_ids and t in node_ids:
+                graph[s].add(t)
+                graph[t].add(s)
+
+        start = node_ids[0]
+        seen = set([start])
+        q = deque([start])
+        while q:
+            u = q.popleft()
+            for v in graph[u]:
+                if v not in seen:
+                    seen.add(v)
+                    q.append(v)
+        return len(seen) == len(node_ids)
+
+    def _build_node_pad_net_map(self, micro_detail: Dict) -> Dict[str, Dict[str, str]]:
+        result: Dict[str, Dict[str, str]] = {}
+        for node in micro_detail.get("nodes", []):
+            node_id = node.get("id")
+            pads = node.get("pads", {})
+            if not node_id or not isinstance(pads, dict):
+                continue
+            result[node_id] = {
+                pad_id: str(pad.get("net", ""))
+                for pad_id, pad in pads.items()
+                if isinstance(pad, dict)
+            }
+        return result
+
+    def _parse_level1_endpoint(self, endpoint: str):
+        # M1_Comp_2.Pad_3(GND)
+        if "." not in endpoint or "(" not in endpoint or not endpoint.endswith(")"):
+            return None, None, None
+        comp_id, right = endpoint.split(".", 1)
+        pad_id, net_with_end = right.split("(", 1)
+        net_label = net_with_end[:-1]
+        return comp_id, pad_id, net_label
+
+    def _extract_numeric_suffix(self, text: str, default: int = 0) -> int:
+        if not text:
+            return default
+        buf = ""
+        for ch in reversed(text):
+            if ch.isdigit():
+                buf = ch + buf
+            elif buf:
+                break
+        return int(buf) if buf else default
