@@ -14,8 +14,8 @@ class GeneratorConfig:
     #canvas_width: float = 40.0
     #canvas_height: float = 40.0
     
-    canvas_width: float = 20.0
-    canvas_height: float = 20.0
+    canvas_width: float = 30.0
+    canvas_height: float = 30.0
     # Micro 分区设置
     num_micros_range: Tuple[int, int] = (2, 3) # Micro 数量范围
     micro_margin: float = 0.3  # Micro 之间的最小间距
@@ -23,11 +23,11 @@ class GeneratorConfig:
     
     # 元件数量分布（每个 Micro）
     # components_per_micro_range: Tuple[int, int] = (60, 90)
+    components_per_micro_range: Tuple[int, int] = (10, 20)
+    # components_per_micro_range: Tuple[int, int] = (3, 5)
 
-    #components_per_micro_range: Tuple[int, int] = (10, 20)
-    components_per_micro_range: Tuple[int, int] = (3, 5)
     # 密度分布
-    density_range: Tuple[float, float] = (0.5, 0.6)
+    density_range: Tuple[float, float] = (0.95, 0.96)
     
     # 元件尺寸分布
     size_scale: float = 0.1
